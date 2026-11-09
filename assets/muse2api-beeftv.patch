@@ -1,0 +1,263 @@
+diff --git a/app.py b/app.py
+index a66cd73..8c5c502 100644
+--- a/app.py
++++ b/app.py
+@@ -46,7 +46,7 @@ from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
+ from fastapi.exceptions import RequestValidationError
+ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
+                                Response, StreamingResponse)
+-from pydantic import model_validator, BaseModel, Field, SecretStr, field_validator
++from pydantic import ValidationError, model_validator, BaseModel, Field, SecretStr, field_validator
+ 
+ from config import CFG
+ from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
+@@ -955,7 +955,7 @@ def build_video_prompt(r: VideoRequest, kinds: list[str] | None = None) -> str:
+     elif len(refs) > 1 and _REFERENCE_TOKEN.search(user_prompt):
+         reference_instruction = (
+             f"基于我本次上传的 {len(refs)} 张参考图片生成视频（{_reference_legend(kinds)}；"
+-            "各图片的用途以下面的描述为准，未说明时以第一张作为主要起始画面；严禁使用历史图片或其他图像）")
++            "各图片的用途以下面的描述为准；严禁使用历史图片或其他图像）")
+     elif len(refs) > 1:
+         reference_instruction = (
+             f"基于我本次上传的 {len(refs)} 张参考图片生成视频（以第一张作为主要起始画面，"
+@@ -1172,10 +1172,12 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
+                 last_exc = exc
+                 store.mark(cur_acc["id"], False, str(exc))
+                 engine.close_current_page()
++                break
+             except MuseProxyError as exc:
+                 last_exc = exc
+                 store.touch_keepalive(cur_acc["id"], None, f"代理异常: {str(exc)[:160]}")
+                 engine.close_current_page()
++                break
+             except MuseGenerationError as exc:
+                 last_exc = exc
+                 store.mark(cur_acc["id"], True, f"任务异常: {str(exc)[:60]}")
+@@ -1183,9 +1185,12 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
+                     engine.reset_thread()
+                 except Exception:
+                     pass
++                # 提交状态不明时不可自动换号重发，避免重复扣费。
++                break
+             except Exception as exc:  # noqa: BLE001
+                 engine.close_current_page()
+                 last_exc = MuseGenerationError(f"生成失败: {exc}")
++                break
+         raise last_exc
+     finally:
+         if cur_acc:
+@@ -1450,7 +1455,54 @@ async def images_edits(request: Request, _=Depends(auth)):
+ # ------------------------- 生视频（异步任务） -------------------------
+ @app.post("/v1/videos")
+ @app.post("/v1/videos/generations")
+-async def create_video(req: VideoRequest, _=Depends(auth)):
++@app.post("/v1/video/generations")
++async def create_video(request: Request, _=Depends(auth)):
++    """Accept both the upstream JSON contract and BeefTV's OpenAI multipart form."""
++    content_type = request.headers.get("content-type", "").lower()
++    try:
++        if content_type.startswith("multipart/form-data"):
++            form = await request.form(max_files=2, max_fields=30,
++                                      max_part_size=MAX_REFERENCE_IMAGE_BYTES)
++            fields = {name: form.get(name) for name in
++                      ("prompt", "model", "size", "aspect_ratio", "resolution", "timeout")
++                      if form.get(name) not in (None, "")}
++            seconds = form.get("seconds") or form.get("duration")
++            if seconds:
++                fields["duration"] = seconds
++            upload = form.get("input_reference")
++            if upload is not None:
++                if not hasattr(upload, "read"):
++                    raise HTTPException(400, "input_reference must be an image file")
++                data = await upload.read(MAX_REFERENCE_IMAGE_BYTES + 1)
++                if len(data) > MAX_REFERENCE_IMAGE_BYTES:
++                    raise HTTPException(413, "reference image is too large")
++                mime = upload.content_type or "application/octet-stream"
++                if not mime.startswith("image/"):
++                    raise HTTPException(400, "input_reference must be an image")
++                fields["reference_image"] = f"data:{mime};base64,{base64.b64encode(data).decode()}"
++            req = VideoRequest.model_validate(fields)
++        else:
++            body = await request.json()
++            if request.url.path == "/v1/video/generations":
++                if not isinstance(body, dict):
++                    raise ValueError("invalid video request")
++                # BeefTV 的 JSON 视频协议使用 ratio，并在图片对象中携带角色。
++                body = dict(body)
++                if body.get("ratio") and not body.get("aspect_ratio"):
++                    body["aspect_ratio"] = body["ratio"]
++                roles = []
++                for index, item in enumerate(body.get("images") or [], 1):
++                    if isinstance(item, dict):
++                        role = item.get("role")
++                        if role in ("first_frame", "last_frame", "reference_image"):
++                            label = {"first_frame": "首帧参考", "last_frame": "尾帧参考",
++                                     "reference_image": "角色或内容参考"}[role]
++                            roles.append(f"[图{index}] 是第{index}张图片，为{label}")
++                if roles:
++                    body["prompt"] = (str(body.get("prompt") or "") + "\n参考图用途：" + "；".join(roles))
++            req = VideoRequest.model_validate(body)
++    except (ValidationError, ValueError, json.JSONDecodeError) as exc:
++        raise HTTPException(422, "invalid video request") from exc
+     ref_images = await asyncio.to_thread(
+         _prepare_reference_images, _video_references(req))
+ 
+@@ -1490,6 +1542,7 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
+ 
+ @app.get("/v1/videos/{task_id}")
+ @app.get("/v1/videos/generations/{task_id}")
++@app.get("/v1/video/generations/{task_id}")
+ def get_video(task_id: str, _=Depends(auth)):
+     t = store.get_task(task_id)
+     if not t:
+@@ -1508,11 +1561,25 @@ def get_video(task_id: str, _=Depends(auth)):
+         vurl = out["result"].get("url")
+     if vurl:
+         out["url"] = vurl
++        # JSON 视频协议的结果位于 data 数组；旧渠道继续使用原响应字段。
++        out["data"] = [{"url": vurl}]
+         if "video" not in out:
+             out["video"] = {"url": vurl}
+     return out
+ 
+ 
++@app.get("/v1/videos/{task_id}/content")
++def get_video_content(task_id: str, _=Depends(auth)):
++    task = store.get_task(task_id)
++    filename = ((task or {}).get("result") or {}).get("filename")
++    if not filename or os.path.basename(filename) != filename:
++        raise HTTPException(404, "video not available")
++    path = os.path.join(CFG.media_dir, filename)
++    if not os.path.isfile(path):
++        raise HTTPException(404, "video not available")
++    return FileResponse(path, media_type="video/mp4")
++
++
+ # ------------------------- 对话（OpenAI 兼容） -------------------------
+ def _sse(obj: dict) -> str:
+     return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
+@@ -2830,7 +2897,7 @@ async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
+ async def _startup():
+     for task in list(store.tasks.values()):
+         if task.get("kind") in ("image", "video") and task.get("status") in ("queued", "processing"):
+-            store.update_task(task["id"], status="failed", error="服务重启中断了任务，请重新提交")
++            store.update_task(task["id"], status="failed", error="服务重启中断了任务；请先检查 Muse 生成记录，再决定是否重新提交")
+     if not CFG.api_key:
+         import secrets
+         new_key = "m2a_" + secrets.token_hex(24)
+diff --git a/engine.py b/engine.py
+index 545aebc..9073768 100644
+--- a/engine.py
++++ b/engine.py
+@@ -1011,9 +1011,7 @@ class MuseEngine:
+             return []
+ 
+     # ---------------- 发送 ----------------
+-    # 检查「文字真的进了输入框 + Send 按钮真的被渲染出来」。
+-    # 两个条件缺一不可：Send 按钮只有 React state 里有文字才会渲染 ——
+-    # 它在，就说明 React 真的收到了输入（不是 DOM value 被改了而已）。
++    # 有附件时，即使没有文字也可能显示发送按钮；不能以此判断文字已就绪。
+     _SEND_STATE_JS = (
+         "(function(){var ta=document.querySelector('textarea');"
+         "var b=[...document.querySelectorAll('button,[role=button]')]"
+@@ -1065,44 +1063,36 @@ class MuseEngine:
+             self.page.send("Input.insertText", {"text": prompt})
+             self.page.js(_SETTER_JS % json.dumps(prompt))
+ 
+-        # 等待发送按钮就绪并点击
+-        clicked = "no-button"
+-        t_deadline = time.time() + 3.0
+-        while time.time() < t_deadline:
+-            res = self.page.js(
+-                "(function(){var b=[...document.querySelectorAll('button,[role=button]')]"
+-                ".filter(function(x){return x.offsetParent!==null;})"
+-                ".find(function(x){return /发送|send/i.test(x.getAttribute('aria-label')||'')"
+-                "||/发送|send/i.test(x.getAttribute('data-testid')||'')"
+-                "||/send/i.test(x.innerText||'');});"
+-                "if(!b)return 'no-button';"
+-                "if(b.disabled)return 'disabled';"
+-                "b.click();return 'clicked';})()")
+-            if res == "clicked":
+-                clicked = "clicked"
++        # 验证输入框与 React 状态，再以浏览器真实鼠标事件点击一次。
++        # 事件发出后不再补点或按回车：网络延迟时无法证明第一次未被接收。
++        target = None
++        t_deadline = time.monotonic() + 10.0
++        while time.monotonic() < t_deadline:
++            raw = self.page.js("""(function(expected){
++                var ta=document.querySelector('textarea');
++                if(!ta || ta.value!==expected) return '';
++                var key=Object.keys(ta).find(function(k){return k.indexOf('__reactProps$')===0;});
++                if(key && typeof ta[key].value==='string' && ta[key].value!==expected) return '';
++                var b=[...document.querySelectorAll('button,[role=button]')].find(function(x){
++                    return x.offsetParent!==null && !x.disabled && x.getAttribute('aria-disabled')!=='true'
++                        && /发送|send/i.test((x.getAttribute('aria-label')||'')+' '+(x.getAttribute('data-testid')||''));
++                });
++                if(!b) return '';
++                var r=b.getBoundingClientRect();
++                if(!r.width || !r.height) return '';
++                return JSON.stringify({x:r.left+r.width/2,y:r.top+r.height/2});
++            })(%s)""" % json.dumps(prompt))
++            if raw:
++                target = json.loads(raw)
+                 break
+-            time.sleep(0.08)
+-
+-        if clicked != "clicked":
+-            # 兜底：Ctrl+Enter 或普通 Enter
+-            for combo in ({"modifiers": 1}, {}):
+-                for t in ("keyDown", "char", "keyUp"):
+-                    params = {"type": t, "key": "Enter", "code": "Enter",
+-                              "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13,
+-                              "modifiers": combo.get("modifiers", 0)}
+-                    if t == "char":
+-                        params["text"] = "\r"
+-                        params["unmodifiedText"] = "\r"
+-                    self.page.send("Input.dispatchKeyEvent", params)
+-                time.sleep(1.0)
+-                try:
+-                    if self.page.js("!(document.querySelector('textarea')||{value:''}).value"):
+-                        clicked = "enter-sent"
+-                        break
+-                except Exception:
+-                    pass
++            time.sleep(0.1)
++        if not target:
++            raise MuseGenerationError("发送前检查未通过：文字或发送按钮尚未就绪")
++        for event in ("mousePressed", "mouseReleased"):
++            self.page.send("Input.dispatchMouseEvent", {"type": event, "x": target["x"],
++                           "y": target["y"], "button": "left", "clickCount": 1})
+         time.sleep(0.3)
+-        return clicked
++        return "clicked"
+ 
+     def _composer_unsent(self) -> str:
+         """输入框里还留着什么（没发出去的附件 / 文字）；空串 = 输入框是空的。读不到时按空处理（不误判）。"""
+@@ -1170,7 +1160,6 @@ class MuseEngine:
+         previous_state = None
+         last_activity = t_start
+         progress_sent = 0
+-        resent = False
+         while time.time() < deadline:
+             if stop_event is not None and stop_event.is_set():
+                 raise MuseGenerationError("客户端已断开连接，终止生成任务")
+@@ -1263,16 +1252,11 @@ class MuseEngine:
+                     except Exception:
+                         pass
+ 
+-            # COOL AI 2026-11-08：发出 25 秒后模型毫无回复、输入框里还留着附件 / 文字 = 这条消息没发出去。
+-            # 补点一次发送；60 秒仍没发出就报错，交给外层换号重试（以前要干等到总超时 10 分钟）。
++            # 发出后不自动重试，避免上游延迟时重复扣费。
+             if elapsed > 25.0 and cur_cnt == base_agent_cnt:
+                 unsent = self._composer_unsent()
+-                if unsent and not resent:
+-                    resent = True
+-                    log.warning("提示词发出 %.0f 秒后仍在输入框（%s），补点一次发送", elapsed, unsent)
+-                    self._click_send()
+-                elif unsent and elapsed > 60.0:
+-                    raise MuseGenerationError("提示词没有发出去（%s 仍在输入框里），终止等待并换号重试" % unsent)
++                if unsent and elapsed > 60.0:
++                    raise MuseGenerationError("发送状态未确认（%s 仍在输入框里）；请先检查 Muse 生成记录，再决定是否重试" % unsent)
+ 
+             if re.search(r"额度不足|积分不足|out of credits|达到上限|token limit", tail, re.I):
+                 raise MuseGenerationError("账号额度不足")
